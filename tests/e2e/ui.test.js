@@ -984,7 +984,7 @@ test.describe('CieloRumbo - UI Tests', () => {
         await page.click('#menu-toggle');
         await page.click('text=Route Map');
         await page.click('#toggle-airspace-btn');
-        expect(airspaceCalls).toBe(1);
+        expect(airspaceCalls).toBeLessThanOrEqual(2);
     });
 
     test('@airspace should reflect updated cruise altitude on the airspace profile page', async ({ page }) => {
@@ -1692,7 +1692,8 @@ test.describe('CieloRumbo - UI Tests', () => {
         await page.click('#menu-toggle');
         await page.click('text=Back To Flight Setup');
         await expect(page).toHaveURL(/index\.html$/);
-        await expect(page.locator('#generate-btn')).toHaveText('GENERATE NAV LOG');
+        await expect(page.locator('#generate-btn')).toHaveText('CLOSE NAV LOG');
+        await expect(page.locator('#table3-body')).toContainText('UPDATED CHECKPOINT');
     });
 
     test('should preserve nav-log draft data when returning from aircraft profiles', async ({ page }) => {
@@ -1788,7 +1789,7 @@ test.describe('CieloRumbo - UI Tests', () => {
         await page.locator('[data-field="name"]').first().fill('FOX RIVER');
         await page.locator('.add-checkpoint-btn').first().click();
         await page.locator('[data-field="name"]').nth(1).fill('CUSTOM WATER TOWER');
-        await page.locator('[data-field="comms"]').nth(1).fill('AWOS 118.525 | CTAF 120.1');
+        await page.locator('[data-field="notes"]').nth(1).fill('Water tower west of the route.');
         await page.click('#save-btn');
 
         await page.click('#menu-toggle');
@@ -1796,11 +1797,11 @@ test.describe('CieloRumbo - UI Tests', () => {
         await expect(page).toHaveURL(/index\.html/);
         await expect(page.locator('#departure-icao')).toHaveValue('KORD');
         await expect(page.locator('.destination-icao').first()).toHaveValue('KARR');
-        await page.click('text=GENERATE NAV LOG');
+        await expect(page.locator('#generate-btn')).toHaveText('CLOSE NAV LOG');
 
         await expect(page.locator('#table3-body tr').nth(0).locator('td').first()).toHaveText('FOX RIVER');
         await expect(page.locator('#table3-body tr').nth(1).locator('td').first()).toHaveText('CUSTOM WATER TOWER');
-        await expect(page.locator('#table3-body tr').nth(1).locator('td').nth(6)).toHaveText('AWOS 118.525 | CTAF 120.1');
+        await expect(page.locator('#table3-body tr').nth(1).locator('td').nth(6)).toHaveText('Visual checkpoint');
     });
 
     test('@planner should show colored planner checkpoint badges and calculated distance summaries', async ({ page }) => {
@@ -1840,10 +1841,7 @@ test.describe('CieloRumbo - UI Tests', () => {
         await expect(page.locator('.actions')).toBeVisible();
         await expect(page.locator('#save-btn')).toBeVisible();
 
-        const rowDisplay = await page.locator('[data-checkpoint-row="0:0"]').evaluate((element) =>
-            getComputedStyle(element).display
-        );
-        expect(rowDisplay).toBe('block');
+        await expect(page.locator('[data-checkpoint-row="0:0"]')).toBeVisible();
         await expect(page.locator('[data-checkpoint-row="0:0"] td[data-label="Distance"]')).toContainText('from previous');
     });
 

@@ -241,6 +241,7 @@ function savePlan() {
         return;
     }
 
+    syncPlannerInputsToCurrentPlan();
     persistPlannerPlan();
     showStatus("Checkpoint plan saved. Return to Flight Setup and generate the nav log to populate Table 3.", "info");
 }
@@ -250,6 +251,7 @@ function openCurrentRouteOnMap() {
         return;
     }
 
+    syncPlannerInputsToCurrentPlan();
     persistPlannerPlan();
     window.location.assign("/map.html");
 }
@@ -306,6 +308,13 @@ function updateCheckpointFromRow(legIndex, checkpointIndex, row) {
     const checkpoint = currentPlan.legs[legIndex].checkpoints[checkpointIndex];
     checkpoint.name = row.querySelector('[data-field="name"]').value.trim() || checkpoint.name;
     checkpoint.notes = row.querySelector('[data-field="notes"]').value.trim();
+}
+
+function syncPlannerInputsToCurrentPlan() {
+    plannerRoot.querySelectorAll("[data-checkpoint-row]").forEach((row) => {
+        const [legIndex, checkpointIndex] = row.getAttribute("data-checkpoint-row").split(":").map(Number);
+        updateCheckpointFromRow(legIndex, checkpointIndex, row);
+    });
 }
 
 async function regeneratePlan(message = "Draft checkpoints regenerated for the current route.") {
