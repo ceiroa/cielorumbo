@@ -424,6 +424,10 @@ test.describe('CieloRumbo - UI Tests', () => {
 
         await page.fill('#date', '2026-05-01T14:30');
 
+        await expect.poll(() => weatherCalls.filter((call) => (
+            (call.icao === 'KORD' || call.icao === 'KARR')
+                && call.datetime === '2026-05-01T19:30:00.000Z'
+        )).length).toBe(2);
         await expect(page.locator('#dep-temp')).toHaveValue('16');
         await expect(page.locator('.leg-temp').first()).toHaveValue('14');
         await expect(page.locator('#dep-weather-status')).toContainText('Forecast loaded for KORD.');
