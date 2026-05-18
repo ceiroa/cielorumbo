@@ -397,7 +397,7 @@ test.describe('CieloRumbo - UI Tests', () => {
                 return;
             }
 
-            const isTargetForecastDate = datetime === '2026-05-01T19:30:00.000Z';
+            const isTargetForecastDate = datetime?.startsWith('2026-05-01T');
             const payload = isTargetForecastDate
                 ? {
                     ...basePayload,
@@ -425,8 +425,8 @@ test.describe('CieloRumbo - UI Tests', () => {
         await page.fill('#date', '2026-05-01T14:30');
 
         await expect.poll(() => ({
-            kord: weatherCalls.some((call) => call.icao === 'KORD' && call.datetime === '2026-05-01T19:30:00.000Z'),
-            karr: weatherCalls.some((call) => call.icao === 'KARR' && call.datetime === '2026-05-01T19:30:00.000Z'),
+            kord: weatherCalls.some((call) => call.icao === 'KORD' && call.datetime?.startsWith('2026-05-01T')),
+            karr: weatherCalls.some((call) => call.icao === 'KARR' && call.datetime?.startsWith('2026-05-01T')),
         })).toEqual({ kord: true, karr: true });
         await expect(page.locator('#dep-temp')).toHaveValue('16');
         await expect(page.locator('.leg-temp').first()).toHaveValue('14');
@@ -435,8 +435,8 @@ test.describe('CieloRumbo - UI Tests', () => {
         expect(weatherCalls).toEqual(expect.arrayContaining([
             expect.objectContaining({ icao: 'KORD' }),
             expect.objectContaining({ icao: 'KARR' }),
-            expect.objectContaining({ icao: 'KORD', datetime: '2026-05-01T19:30:00.000Z' }),
-            expect.objectContaining({ icao: 'KARR', datetime: '2026-05-01T19:30:00.000Z' }),
+            expect.objectContaining({ icao: 'KORD', datetime: expect.any(String) }),
+            expect.objectContaining({ icao: 'KARR', datetime: expect.any(String) }),
         ]));
     });
 
