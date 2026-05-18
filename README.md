@@ -95,6 +95,10 @@ To keep future changes stable:
 
 Analytics is wired through `public/js/analytics.js` and disabled by default in `public/js/analyticsConfig.js`. Create the PostHog project later, add the project API key there, and enable the config before expecting events to appear.
 
+## Future Features
+
+See `FUTURE_FEATURES.md` for the public/open-source backlog and product-boundary notes.
+
 ## GitHub Pages
 
 The public landing/docs site lives under `docs/`.
