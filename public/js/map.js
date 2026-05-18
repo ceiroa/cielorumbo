@@ -1,5 +1,7 @@
 import {
     CHECKPOINT_PLAN_VERSION,
+    markNavLogDirty,
+    clearNavLogSnapshot,
     createRouteSignature,
     getCheckpointPlanForRoute,
     loadFlightDraft,
@@ -9,11 +11,14 @@ import {
     saveAirspaceCache,
     saveWeatherCache,
 } from "./flightStore.js";
+import { trackEvent } from "./analytics.js";
 
 const FAA_VFR_CHARTS_URL = "https://www.faa.gov/air_traffic/flight_info/aeronav/digital_products/vfr/index.cfm";
 const FAA_SECTIONAL_INFO_URL = "https://www.faa.gov/air_traffic/flight_info/aeronav/productcatalog/vfrcharts/sectional/";
 const FAA_TAC_INFO_URL = "https://www.faa.gov/air_traffic/flight_info/aeronav/productcatalog/vfrcharts/terminalarea/";
 const AIRSPACE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const AIRSPACE_MOVE_REFRESH_DEBOUNCE_MS = 350;
+const WEATHER_MOVE_REFRESH_DEBOUNCE_MS = 350;
 const WEATHER_FETCH_TIMEOUT_MS = 15000;
 const WEATHER_CACHE_TTL_MS = 15 * 60 * 1000;
 const DEFAULT_CHECKPOINT_NOTE = "Visual checkpoint";
@@ -83,11 +88,16 @@ const state = {
     sectionalOverlayMetadata: null,
     sectionalOverlayPromise: null,
     routeLines: [],
+    routeHitLines: [],
+    rubberBandPreviewLine: null,
+    rubberBandLongPressTimer: null,
     routeBounds: null,
     routePoints: [],
     legSegments: [],
     airportMarkers: [],
     weatherMarkersVisible: false,
+    weatherLayerRefreshTimer: null,
+    weatherLayerRequestId: 0,
     areaWeatherMarkers: [],
     checkpointMarkers: [],
     checkpointButtons: [],
@@ -109,13 +119,19 @@ const state = {
     showCurrentLocation: false,
     airspaceLayer: null,
     showAirspace: false,
+    airspaceRefreshTimer: null,
+    airspaceRequestId: 0,
     routeSignature: "",
     currentDraft: null,
     contextAddLatLng: null,
+    pendingRouteBend: null,
+    activeRubberBand: null,
+    suppressMapContextMenuUntil: 0,
     isFaaCoverageRoute: true,
     weatherByIcao: new Map(),
     mobileMapLayout: false,
     hasInitializedResponsiveLayout: false,
+    hasTrackedMapOpen: false,
 };
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -123,6 +139,7 @@ document.addEventListener("DOMContentLoaded", () => {
         setMenuOpenState(!sideMenu.classList.contains("open"));
     });
     document.addEventListener("click", handleDocumentClick, true);
+    document.addEventListener("click", handlePopupDocumentClick, true);
     document.addEventListener("keydown", handleDocumentKeydown);
     mapRoot.addEventListener("click", handleMapRootClick);
 
@@ -170,8 +187,31 @@ function handleMapRootClick(event) {
 
     const contextAddButton = event.target.closest("[data-map-context-add]");
     if (contextAddButton) {
-        addCheckpointFromMapClick(state.contextAddLatLng);
+        const popup = contextAddButton.closest(".map-context-popup");
+        const nameInput = popup?.querySelector("[data-map-context-name]");
+        addCheckpointFromMapClick(state.contextAddLatLng, nameInput?.value);
+        return;
     }
+
+    const bendAddButton = event.target.closest("[data-route-bend-add]");
+    if (bendAddButton) {
+        const popup = bendAddButton.closest(".map-context-popup");
+        const nameInput = popup?.querySelector("[data-map-context-name]");
+        addCheckpointFromPendingBend(nameInput?.value);
+    }
+}
+
+function handlePopupDocumentClick(event) {
+    const bendAddButton = event.target.closest("[data-route-bend-add]");
+    if (!bendAddButton) {
+        return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    const popup = bendAddButton.closest(".map-context-popup");
+    const nameInput = popup?.querySelector("[data-map-context-name]");
+    addCheckpointFromPendingBend(nameInput?.value);
 }
 
 function setMenuOpenState(isOpen) {
@@ -180,17 +220,27 @@ function setMenuOpenState(isOpen) {
 }
 
 function renderMapPage(draft) {
+    destroyCurrentMap();
     state.airportMarkers = [];
     state.weatherByIcao = new Map();
     state.currentDraft = draft;
     state.contextAddLatLng = null;
+    state.pendingRouteBend = null;
     const routePoints = buildRoutePoints(draft);
-    const legSegments = buildLegSegments(routePoints);
     const checkpointPlan = getCheckpointPlanForRoute(draft);
+    const legSegments = buildLegSegments(routePoints, checkpointPlan);
     const checkpointMarkers = buildCheckpointMarkers(routePoints, checkpointPlan);
     const chartReferences = buildChartReferences(routePoints);
     const isFaaCoverageRoute = routePoints.every((point) => isConterminousUsPoint(point.lat, point.lon));
     state.isFaaCoverageRoute = isFaaCoverageRoute;
+    if (!state.hasTrackedMapOpen) {
+        state.hasTrackedMapOpen = true;
+        trackEvent("map_opened", {
+            source: "map_page",
+            leg_count: routePoints.length > 0 ? routePoints.length - 1 : 0,
+            checkpoint_count: countPlanCheckpoints(checkpointPlan),
+        });
+    }
 
     mapRoot.innerHTML = `
         <div class="map-layout">
@@ -389,6 +439,25 @@ function renderMapPage(draft) {
     void loadRouteWeather(draft, routePoints);
 }
 
+function destroyCurrentMap() {
+    if (state.map) {
+        state.map.remove();
+    }
+    state.map = null;
+    state.baseLayers = {};
+    state.sectionalOverlayLayer = null;
+    state.routeLines = [];
+    state.routeBounds = null;
+    state.routeHitLines = [];
+    clearScheduledAirspaceRefresh();
+    clearScheduledWeatherLayerRefresh();
+    clearRubberBandPreview();
+    state.checkpointMarkers = [];
+    state.referenceCheckpointMarkers = [];
+    state.areaWeatherMarkers = [];
+    state.airportMarkers = [];
+}
+
 function initializeLeafletMap(routePoints, legSegments, checkpointMarkers) {
     const map = window.L.map("route-map", {
         zoomControl: true,
@@ -412,6 +481,14 @@ function initializeLeafletMap(routePoints, legSegments, checkpointMarkers) {
         color: segment.color,
         weight: 4,
         opacity: 0.9,
+    }).addTo(map));
+    const routeHitLines = legSegments.map((segment) => window.L.polyline(segment.latLngs, {
+        color: segment.color,
+        weight: 24,
+        opacity: 0.01,
+        interactive: true,
+        bubblingMouseEvents: false,
+        className: "route-rubber-band-hit-line",
     }).addTo(map));
 
     routePoints.forEach((point, index) => {
@@ -441,6 +518,10 @@ function initializeLeafletMap(routePoints, legSegments, checkpointMarkers) {
         checkpoint.marker.on("click", () => highlightCheckpoint(index));
     });
 
+    legSegments.forEach((segment) => {
+        attachRubberBandHandlers(map, segment, routeLines[segment.index], routeHitLines[segment.index]);
+    });
+
     const routeGroup = window.L.featureGroup(routeLines);
     map.fitBounds(routeGroup.getBounds(), {
         padding: [30, 30],
@@ -452,16 +533,17 @@ function initializeLeafletMap(routePoints, legSegments, checkpointMarkers) {
         terrain: terrainLayer,
     };
     state.routeLines = routeLines;
+    state.routeHitLines = routeHitLines;
     state.routeBounds = routeGroup.getBounds();
     map.on("moveend", () => {
         if (state.showReferenceCheckpoints) {
             void refreshReferenceCheckpoints();
         }
         if (state.showAirspace) {
-            void refreshAirspaceOverlay();
+            scheduleAirspaceOverlayRefresh();
         }
         if (state.weatherMarkersVisible) {
-            void refreshAreaWeatherLayer();
+            scheduleAreaWeatherLayerRefresh();
         }
     });
     map.on("click", handleMapSurfaceClick);
@@ -776,8 +858,258 @@ function matchesCheckpointFilters(checkpoint) {
     return matchesType && matchesSource;
 }
 
+function attachRubberBandHandlers(map, segment, routeLine, hitLine) {
+    if (!routeLine || !hitLine || segment.latLngs.length < 2) {
+        return;
+    }
+
+    hitLine.on("mousedown", (event) => {
+        const originalEvent = event.originalEvent;
+        if (originalEvent?.button === 2) {
+            startRubberBandDrag(map, segment, routeLine, event.latlng, event);
+            return;
+        }
+
+        scheduleRubberBandLongPress(map, segment, routeLine, event.latlng, event);
+    });
+    hitLine.on("touchstart", (event) => {
+        const latlng = getTouchLatLng(map, event) || event.latlng;
+        scheduleRubberBandLongPress(map, segment, routeLine, latlng, event);
+    });
+    hitLine.on("mouseup mouseout touchend touchcancel", cancelRubberBandLongPress);
+    hitLine.on("contextmenu", (event) => {
+        if (state.activeRubberBand) {
+            window.L.DomEvent.preventDefault(event.originalEvent);
+            return;
+        }
+        startRubberBandDrag(map, segment, routeLine, event.latlng, event);
+    });
+}
+
+function scheduleRubberBandLongPress(map, segment, routeLine, latlng, event) {
+    cancelRubberBandLongPress();
+    state.rubberBandLongPressTimer = window.setTimeout(() => {
+        startRubberBandDrag(map, segment, routeLine, latlng, event);
+    }, 450);
+}
+
+function cancelRubberBandLongPress() {
+    if (state.rubberBandLongPressTimer) {
+        window.clearTimeout(state.rubberBandLongPressTimer);
+        state.rubberBandLongPressTimer = null;
+    }
+}
+
+function startRubberBandDrag(map, segment, routeLine, latlng, event) {
+    if (!map || !routeLine || !latlng) {
+        return;
+    }
+
+    cancelRubberBandLongPress();
+    window.L.DomEvent.preventDefault(event.originalEvent);
+    window.L.DomEvent.stopPropagation(event.originalEvent);
+    state.suppressMapContextMenuUntil = Date.now() + 1200;
+    map.closePopup();
+    map.dragging.disable();
+
+    const vertexIndex = findNearestSegmentVertexIndex(segment, latlng);
+    const previewLatLngs = buildRubberBandPreviewLatLngs(segment, vertexIndex, latlng);
+    state.activeRubberBand = {
+        legIndex: segment.index,
+        vertexIndex,
+        routeLine,
+        originalLatLngs: segment.latLngs,
+    };
+    state.rubberBandPreviewLine = window.L.polyline(previewLatLngs, {
+        color: segment.color,
+        weight: 5,
+        opacity: 0.95,
+        dashArray: "8 8",
+        interactive: false,
+        className: "route-rubber-band-preview-line",
+    }).addTo(map);
+    routeLine.setStyle({ opacity: 0.35 });
+    updateCheckpointEditStatus("Pull the route line, then release to save the bend as a checkpoint.");
+
+    map.on("mousemove", handleRubberBandMove);
+    map.on("mouseup", finishRubberBandDrag);
+    map.on("touchmove", handleRubberBandTouchMove);
+    map.on("touchend", finishRubberBandTouchDrag);
+    map.on("touchcancel", cancelRubberBandDrag);
+}
+
+function handleRubberBandMove(event) {
+    if (!state.activeRubberBand || !state.rubberBandPreviewLine) {
+        return;
+    }
+
+    const segment = state.legSegments[state.activeRubberBand.legIndex];
+    const previewLatLngs = buildRubberBandPreviewLatLngs(segment, state.activeRubberBand.vertexIndex, event.latlng);
+    state.rubberBandPreviewLine.setLatLngs(previewLatLngs);
+}
+
+function handleRubberBandTouchMove(event) {
+    const latlng = getTouchLatLng(state.map, event);
+    if (!latlng) {
+        return;
+    }
+
+    handleRubberBandMove({ latlng });
+}
+
+function finishRubberBandDrag(event) {
+    if (!state.map || !state.activeRubberBand) {
+        return;
+    }
+
+    const { legIndex, vertexIndex, routeLine, originalLatLngs } = state.activeRubberBand;
+    state.map.off("mousemove", handleRubberBandMove);
+    state.map.off("mouseup", finishRubberBandDrag);
+    state.map.off("touchmove", handleRubberBandTouchMove);
+    state.map.off("touchend", finishRubberBandTouchDrag);
+    state.map.off("touchcancel", cancelRubberBandDrag);
+    state.map.dragging.enable();
+    routeLine.setStyle({ opacity: 0.9 });
+    state.pendingRouteBend = {
+        legIndex,
+        vertexIndex,
+        latlng: event.latlng,
+        originalLatLngs,
+    };
+    state.activeRubberBand = null;
+    updateCheckpointEditStatus("Name this route bend to save it as a checkpoint.");
+    window.L.popup()
+        .setLatLng(event.latlng)
+        .setContent(buildRouteBendPopupElement(event.latlng))
+        .openOn(state.map);
+    state.map.once("popupclose", handleRubberBandPopupClosed);
+}
+
+function finishRubberBandTouchDrag(event) {
+    const latlng = getTouchLatLng(state.map, event);
+    if (!latlng) {
+        cancelRubberBandDrag();
+        return;
+    }
+
+    finishRubberBandDrag({ latlng });
+}
+
+function cancelRubberBandDrag() {
+    clearRubberBandPreview();
+    state.pendingRouteBend = null;
+    updateCheckpointEditStatus("Route bend was not saved.");
+}
+
+function handleRubberBandPopupClosed() {
+    if (!state.pendingRouteBend) {
+        return;
+    }
+
+    clearRubberBandPreview();
+    state.pendingRouteBend = null;
+    updateCheckpointEditStatus("Route bend was not saved.");
+}
+
+function clearRubberBandPreview() {
+    cancelRubberBandLongPress();
+    if (state.rubberBandPreviewLine) {
+        state.rubberBandPreviewLine.remove();
+        state.rubberBandPreviewLine = null;
+    }
+    if (state.activeRubberBand?.routeLine) {
+        state.activeRubberBand.routeLine.setStyle({ opacity: 0.9 });
+    }
+    if (state.map) {
+        state.map.off("mousemove", handleRubberBandMove);
+        state.map.off("mouseup", finishRubberBandDrag);
+        state.map.off("touchmove", handleRubberBandTouchMove);
+        state.map.off("touchend", finishRubberBandTouchDrag);
+        state.map.off("touchcancel", cancelRubberBandDrag);
+        state.map.dragging.enable();
+    }
+    state.activeRubberBand = null;
+}
+
+function getTouchLatLng(map, event) {
+    const touch = event.originalEvent?.touches?.[0] || event.originalEvent?.changedTouches?.[0];
+    return touch && map ? map.mouseEventToLatLng(touch) : null;
+}
+
+function findNearestSegmentVertexIndex(segment, latlng) {
+    const projection = findNearestProjectedSubsegment(segment, latlng);
+    return projection?.vertexIndex ?? 0;
+}
+
+function findNearestProjectedSubsegment(segment, latlng) {
+    if (!segment || !Array.isArray(segment.latLngs) || segment.latLngs.length < 2) {
+        return null;
+    }
+
+    let best = null;
+    let cumulativeDistanceNm = 0;
+    for (let vertexIndex = 0; vertexIndex < segment.latLngs.length - 1; vertexIndex += 1) {
+        const start = { lat: segment.latLngs[vertexIndex][0], lon: segment.latLngs[vertexIndex][1] };
+        const end = { lat: segment.latLngs[vertexIndex + 1][0], lon: segment.latLngs[vertexIndex + 1][1] };
+        const projection = projectPointToSegment({ lat: latlng.lat, lon: latlng.lng }, start, end);
+        const crossTrackNm = calculateDistanceNm(latlng.lat, latlng.lng, projection.lat, projection.lon);
+        const segmentDistanceNm = calculateDistanceNm(start.lat, start.lon, end.lat, end.lon);
+        const distanceFromLegStartNm = cumulativeDistanceNm + (segmentDistanceNm * projection.fraction);
+        if (!best || crossTrackNm < best.crossTrackNm) {
+            best = {
+                vertexIndex,
+                crossTrackNm,
+                distanceFromLegStartNm,
+                fraction: projection.fraction,
+            };
+        }
+        cumulativeDistanceNm += segmentDistanceNm;
+    }
+
+    return best;
+}
+
+function buildRubberBandPreviewLatLngs(segment, vertexIndex, latlng) {
+    if (!segment || !Array.isArray(segment.latLngs) || segment.latLngs.length < 2) {
+        return [];
+    }
+
+    const start = segment.latLngs[vertexIndex];
+    const end = segment.latLngs[vertexIndex + 1];
+    const pullPoint = [latlng.lat, latlng.lng];
+    const control = [
+        (2 * pullPoint[0]) - (0.5 * start[0]) - (0.5 * end[0]),
+        (2 * pullPoint[1]) - (0.5 * start[1]) - (0.5 * end[1]),
+    ];
+    const curve = buildQuadraticCurveLatLngs(start, control, end);
+    return [
+        ...segment.latLngs.slice(0, vertexIndex),
+        ...curve,
+        ...segment.latLngs.slice(vertexIndex + 2),
+    ];
+}
+
+function buildQuadraticCurveLatLngs(start, control, end) {
+    const points = [];
+    const steps = 24;
+    for (let step = 0; step <= steps; step += 1) {
+        const t = step / steps;
+        const inverse = 1 - t;
+        points.push([
+            (inverse * inverse * start[0]) + (2 * inverse * t * control[0]) + (t * t * end[0]),
+            (inverse * inverse * start[1]) + (2 * inverse * t * control[1]) + (t * t * end[1]),
+        ]);
+    }
+    return points;
+}
+
 function handleMapContextMenu(event) {
     if (!state.map || !event?.latlng) {
+        return;
+    }
+
+    if (Date.now() < state.suppressMapContextMenuUntil || state.activeRubberBand || state.pendingRouteBend) {
+        window.L.DomEvent.preventDefault(event.originalEvent);
         return;
     }
 
@@ -789,7 +1121,7 @@ function handleMapContextMenu(event) {
         .openOn(state.map);
 }
 
-function addCheckpointFromMapClick(latlng) {
+function addCheckpointFromMapClick(latlng, nameValue = "") {
     if (!state.currentDraft || !latlng) {
         return;
     }
@@ -800,25 +1132,68 @@ function addCheckpointFromMapClick(latlng) {
         return;
     }
 
+    addCheckpointToLegAtPosition({
+        latlng,
+        nameValue,
+        legIndex: nearest.legIndex,
+        distanceFromLegStartNm: nearest.distanceFromLegStartNm,
+        notes: "User-added checkpoint from the route map.",
+    });
+}
+
+function addCheckpointFromPendingBend(nameValue = "") {
+    if (!state.pendingRouteBend?.latlng) {
+        updateCheckpointEditStatus("No route bend is waiting to be saved.");
+        return;
+    }
+
+    const { legIndex, vertexIndex, latlng } = state.pendingRouteBend;
+    const legSegment = state.legSegments[legIndex];
+    const distanceFromLegStartNm = calculateDistanceAlongLegToInsertedPoint(legSegment, vertexIndex, latlng);
+    addCheckpointToLegAtPosition({
+        latlng,
+        nameValue,
+        legIndex,
+        distanceFromLegStartNm,
+        notes: "Route bend checkpoint added from the map.",
+    });
+}
+
+function addCheckpointToLegAtPosition({ latlng, nameValue, legIndex, distanceFromLegStartNm, notes }) {
+    if (!state.currentDraft || !latlng || !Number.isFinite(Number(legIndex))) {
+        return;
+    }
+
     const plan = ensureEditableCheckpointPlan(state.currentDraft);
-    const legPlan = plan.legs[nearest.legIndex];
+    const legPlan = plan.legs[legIndex];
     const checkpoints = Array.isArray(legPlan.checkpoints) ? legPlan.checkpoints : [];
     legPlan.checkpoints = checkpoints;
-    const distanceFromLegStartNm = Math.round(nearest.distanceFromLegStartNm * 10) / 10;
+    const roundedDistance = Math.round((Number(distanceFromLegStartNm) || 0) * 10) / 10;
+    const fallbackName = `Map Checkpoint ${checkpoints.length + 1}`;
+    const checkpointName = String(nameValue || "").trim() || fallbackName;
 
     checkpoints.push({
-        name: `Map Checkpoint ${checkpoints.length + 1}`,
-        distanceFromLegStartNm,
+        name: checkpointName,
+        distanceFromLegStartNm: roundedDistance,
         lat: Math.round(latlng.lat * 100000) / 100000,
-        lon: Math.round(latlng.lng * 100000) / 100000,
+        lon: Math.round((latlng.lng ?? latlng.lon) * 100000) / 100000,
         comms: DEFAULT_CHECKPOINT_NOTE,
         type: "manual",
         source: "user",
-        notes: "User-added checkpoint from the route map.",
+        notes,
     });
     checkpoints.sort((left, right) => (Number(left.distanceFromLegStartNm) || 0) - (Number(right.distanceFromLegStartNm) || 0));
     saveCheckpointPlan(plan);
-    updateCheckpointEditStatus(`Added checkpoint on leg ${nearest.legIndex + 1} at ${distanceFromLegStartNm.toFixed(1)} NM.`);
+    clearNavLogSnapshot();
+    markNavLogDirty(state.routeSignature);
+    clearRubberBandPreview();
+    state.pendingRouteBend = null;
+    trackEvent(notes === "Route bend checkpoint added from the map." ? "route_bend_checkpoint_added" : "checkpoint_added", {
+        source: "map",
+        leg_index: legIndex + 1,
+        checkpoint_count: countPlanCheckpoints(plan),
+    });
+    updateCheckpointEditStatus(`Added ${checkpointName} on leg ${legIndex + 1} at ${roundedDistance.toFixed(1)} NM.`);
     renderMapPage(state.currentDraft);
 }
 
@@ -854,6 +1229,13 @@ function editCheckpoint(index) {
     planCheckpoint.comms = normalizeCheckpointComms(comms);
     planCheckpoint.notes = planCheckpoint.notes || "User-edited checkpoint.";
     saveCheckpointPlan(plan);
+    clearNavLogSnapshot();
+    markNavLogDirty(state.routeSignature);
+    trackEvent("checkpoint_edited", {
+        source: "map",
+        leg_index: checkpoint.legIndex + 1,
+        checkpoint_count: countPlanCheckpoints(plan),
+    });
     updateCheckpointEditStatus(`Updated ${trimmedName}.`);
     renderMapPage(state.currentDraft);
 }
@@ -877,8 +1259,23 @@ function removeCheckpoint(index) {
 
     checkpoints.splice(checkpoint.checkpointIndex, 1);
     saveCheckpointPlan(plan);
+    clearNavLogSnapshot();
+    markNavLogDirty(state.routeSignature);
+    trackEvent("checkpoint_removed", {
+        source: "map",
+        leg_index: checkpoint.legIndex + 1,
+        checkpoint_count: countPlanCheckpoints(plan),
+    });
     updateCheckpointEditStatus(`Removed ${checkpoint.name}.`);
     renderMapPage(state.currentDraft);
+}
+
+function countPlanCheckpoints(plan) {
+    if (!Array.isArray(plan?.legs)) {
+        return 0;
+    }
+
+    return plan.legs.reduce((total, leg) => total + (Array.isArray(leg?.checkpoints) ? leg.checkpoints.length : 0), 0);
 }
 
 function ensureEditableCheckpointPlan(draft) {
@@ -893,12 +1290,7 @@ function ensureEditableCheckpointPlan(draft) {
                 legIndex: index,
                 fromIcao: existingPlan.legs[index]?.fromIcao || segment.fromIcao,
                 toIcao: existingPlan.legs[index]?.toIcao || segment.toIcao,
-                legDistanceNm: Number(existingPlan.legs[index]?.legDistanceNm) || calculateDistanceNm(
-                    segment.latLngs[0][0],
-                    segment.latLngs[0][1],
-                    segment.latLngs[1][0],
-                    segment.latLngs[1][1],
-                ),
+                legDistanceNm: calculatePathDistanceNm(segment.latLngs),
                 spacingNm: Number(existingPlan.legs[index]?.spacingNm) || 7,
                 checkpoints: Array.isArray(existingPlan.legs[index]?.checkpoints)
                     ? [...existingPlan.legs[index].checkpoints]
@@ -916,39 +1308,74 @@ function ensureEditableCheckpointPlan(draft) {
             legIndex: index,
             fromIcao: segment.fromIcao,
             toIcao: segment.toIcao,
-            legDistanceNm: calculateDistanceNm(
-                segment.latLngs[0][0],
-                segment.latLngs[0][1],
-                segment.latLngs[1][0],
-                segment.latLngs[1][1],
-            ),
+            legDistanceNm: calculatePathDistanceNm(segment.latLngs),
             spacingNm: 7,
             checkpoints: [],
         })),
     };
 }
 
+function calculatePathDistanceNm(latLngs) {
+    if (!Array.isArray(latLngs) || latLngs.length < 2) {
+        return 0;
+    }
+
+    let distanceNm = 0;
+    for (let index = 0; index < latLngs.length - 1; index += 1) {
+        distanceNm += calculateDistanceNm(
+            latLngs[index][0],
+            latLngs[index][1],
+            latLngs[index + 1][0],
+            latLngs[index + 1][1],
+        );
+    }
+    return distanceNm;
+}
+
 function findNearestLegProjection(latlng) {
     let best = null;
 
     state.legSegments.forEach((segment) => {
-        const start = { lat: segment.latLngs[0][0], lon: segment.latLngs[0][1] };
-        const end = { lat: segment.latLngs[1][0], lon: segment.latLngs[1][1] };
-        const projection = projectPointToSegment({ lat: latlng.lat, lon: latlng.lng }, start, end);
-        const crossTrackNm = calculateDistanceNm(latlng.lat, latlng.lng, projection.lat, projection.lon);
-        const legDistanceNm = calculateDistanceNm(start.lat, start.lon, end.lat, end.lon);
-        const distanceFromLegStartNm = legDistanceNm * projection.fraction;
-        if (!best || crossTrackNm < best.crossTrackNm) {
-            best = {
-                legIndex: segment.index,
-                crossTrackNm,
-                distanceFromLegStartNm,
-                fraction: projection.fraction,
-            };
+        let cumulativeDistanceNm = 0;
+        for (let vertexIndex = 0; vertexIndex < segment.latLngs.length - 1; vertexIndex += 1) {
+            const start = { lat: segment.latLngs[vertexIndex][0], lon: segment.latLngs[vertexIndex][1] };
+            const end = { lat: segment.latLngs[vertexIndex + 1][0], lon: segment.latLngs[vertexIndex + 1][1] };
+            const projection = projectPointToSegment({ lat: latlng.lat, lon: latlng.lng }, start, end);
+            const crossTrackNm = calculateDistanceNm(latlng.lat, latlng.lng, projection.lat, projection.lon);
+            const segmentDistanceNm = calculateDistanceNm(start.lat, start.lon, end.lat, end.lon);
+            const distanceFromLegStartNm = cumulativeDistanceNm + (segmentDistanceNm * projection.fraction);
+            if (!best || crossTrackNm < best.crossTrackNm) {
+                best = {
+                    legIndex: segment.index,
+                    vertexIndex,
+                    crossTrackNm,
+                    distanceFromLegStartNm,
+                    fraction: projection.fraction,
+                };
+            }
+            cumulativeDistanceNm += segmentDistanceNm;
         }
     });
 
     return best;
+}
+
+function calculateDistanceAlongLegToInsertedPoint(segment, vertexIndex, latlng) {
+    if (!segment || !Array.isArray(segment.latLngs) || segment.latLngs.length < 2) {
+        return 0;
+    }
+
+    let distanceNm = 0;
+    for (let index = 0; index < segment.latLngs.length - 1; index += 1) {
+        const start = segment.latLngs[index];
+        const end = segment.latLngs[index + 1];
+        if (index === vertexIndex) {
+            return distanceNm + calculateDistanceNm(start[0], start[1], latlng.lat, latlng.lng);
+        }
+        distanceNm += calculateDistanceNm(start[0], start[1], end[0], end[1]);
+    }
+
+    return distanceNm;
 }
 
 function projectPointToSegment(point, start, end) {
@@ -979,9 +1406,40 @@ function buildMapContextAddPopup(latlng) {
         <div class="map-context-popup">
             <strong>Add checkpoint here?</strong>
             <span>${escapeHtml(latlng.lat.toFixed(5))}, ${escapeHtml(latlng.lng.toFixed(5))}</span>
+            <label class="map-context-field">
+                <span>Name</span>
+                <input type="text" data-map-context-name value="Map Checkpoint" maxlength="60">
+            </label>
             <button type="button" class="map-popup-button" data-map-context-add="1">Add Checkpoint</button>
         </div>
     `;
+}
+
+function buildRouteBendPopup(latlng) {
+    return `
+        <div class="map-context-popup">
+            <strong>Save route bend?</strong>
+            <span>${escapeHtml(latlng.lat.toFixed(5))}, ${escapeHtml(latlng.lng.toFixed(5))}</span>
+            <label class="map-context-field">
+                <span>Name</span>
+                <input type="text" data-map-context-name value="Route Bend Checkpoint" maxlength="60">
+            </label>
+            <button type="button" class="map-popup-button" data-route-bend-add="1">Save Bend</button>
+        </div>
+    `;
+}
+
+function buildRouteBendPopupElement(latlng) {
+    const container = document.createElement("div");
+    container.innerHTML = buildRouteBendPopup(latlng);
+    const popup = container.firstElementChild;
+    popup.querySelector("[data-route-bend-add]")?.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const nameInput = popup.querySelector("[data-map-context-name]");
+        addCheckpointFromPendingBend(nameInput?.value);
+    });
+    return popup;
 }
 
 function buildRoutePoints(draft) {
@@ -1216,8 +1674,13 @@ function refreshAirportMarkerPopup(icao) {
 
 function toggleWeatherLayer() {
     state.weatherMarkersVisible = !state.weatherMarkersVisible;
+    trackEvent("weather_layer_toggled", {
+        source: "map",
+        enabled: state.weatherMarkersVisible,
+    });
     updateWeatherToggleButton();
     if (!state.weatherMarkersVisible) {
+        clearScheduledWeatherLayerRefresh();
         state.airportMarkers.forEach((entry) => removeAirportWeatherLayer(entry));
         clearAreaWeatherMarkers();
         updateWeatherLayerStatus("Airport weather layer is off.");
@@ -1246,6 +1709,8 @@ async function refreshAreaWeatherLayer() {
         return;
     }
 
+    const requestId = state.weatherLayerRequestId + 1;
+    state.weatherLayerRequestId = requestId;
     updateWeatherLayerStatus("Loading airport weather for the current map view...");
     const bounds = state.map.getBounds();
     const response = await fetch(buildAreaWeatherUrl(bounds));
@@ -1256,6 +1721,10 @@ async function refreshAreaWeatherLayer() {
     }
 
     const payload = await response.json();
+    if (requestId !== state.weatherLayerRequestId || !state.weatherMarkersVisible) {
+        return;
+    }
+
     const routeAirportIds = new Set(state.airportMarkers.map((entry) => entry.icao));
     const items = Array.isArray(payload.items)
         ? payload.items.filter((item) => !routeAirportIds.has(String(item.icao || "").toUpperCase()))
@@ -1267,14 +1736,34 @@ async function refreshAreaWeatherLayer() {
         }
     });
 
-    renderAreaWeatherMarkers(items);
-    const stationCount = items.length;
+    renderAreaWeatherMarkers(items, bounds);
+    const stationCount = state.areaWeatherMarkers.length;
     const truncationNote = payload.truncated ? ` Showing ${stationCount} of ${payload.totalStationsInBounds} stations.` : "";
     updateWeatherLayerStatus(
         stationCount === 0
             ? "No additional visible airport weather stations were found in the current map view."
             : `Airport weather layer loaded for ${stationCount} nearby station${stationCount === 1 ? "" : "s"}.${truncationNote}`,
     );
+}
+
+function scheduleAreaWeatherLayerRefresh() {
+    if (!state.weatherMarkersVisible || !state.map) {
+        return;
+    }
+
+    clearScheduledWeatherLayerRefresh();
+    updateWeatherLayerStatus("Airport weather will update after map movement stops...");
+    state.weatherLayerRefreshTimer = window.setTimeout(() => {
+        state.weatherLayerRefreshTimer = null;
+        void refreshAreaWeatherLayer();
+    }, WEATHER_MOVE_REFRESH_DEBOUNCE_MS);
+}
+
+function clearScheduledWeatherLayerRefresh() {
+    if (state.weatherLayerRefreshTimer) {
+        window.clearTimeout(state.weatherLayerRefreshTimer);
+        state.weatherLayerRefreshTimer = null;
+    }
 }
 
 function buildAreaWeatherUrl(bounds) {
@@ -1293,36 +1782,68 @@ function buildAreaWeatherUrl(bounds) {
     return `/api/weather/area?${params.toString()}`;
 }
 
-function renderAreaWeatherMarkers(items) {
-    clearAreaWeatherMarkers();
+function renderAreaWeatherMarkers(items, bounds) {
     if (!state.map) {
         return;
     }
 
-    state.areaWeatherMarkers = items.map((item) => ({
-        icao: item.icao,
-        name: item.name,
-        lat: Number(item.lat),
-        lon: Number(item.lon),
-        weather: item.weather,
-        marker: null,
-    }));
+    const nextIcaos = new Set(items.map((item) => String(item.icao || "").toUpperCase()));
+    state.areaWeatherMarkers
+        .filter((item) => !nextIcaos.has(String(item.icao || "").toUpperCase()) && !markerIsInsideBounds(item, bounds))
+        .forEach((item) => {
+            if (item.marker && state.map?.hasLayer(item.marker)) {
+                state.map.removeLayer(item.marker);
+            }
+        });
 
     items.forEach((item) => {
+        const icao = String(item.icao || "").toUpperCase();
+        const existing = state.areaWeatherMarkers.find((candidate) => String(candidate.icao || "").toUpperCase() === icao);
+        if (existing?.marker) {
+            existing.name = item.name;
+            existing.lat = Number(item.lat);
+            existing.lon = Number(item.lon);
+            existing.weather = item.weather;
+            existing.marker.setLatLng([Number(item.lat), Number(item.lon)]);
+            existing.marker.setIcon(buildWeatherLayerIcon(item));
+            existing.marker.bindPopup(buildAreaWeatherPopup(item));
+            return;
+        }
+
         const marker = window.L.marker([Number(item.lat), Number(item.lon)], {
-            icon: window.L.divIcon({
-                className: "airport-weather-layer-icon",
-                html: buildAreaWeatherLayerHtml(item),
-                iconSize: [44, 44],
-                iconAnchor: [22, 40],
-            }),
+            icon: buildWeatherLayerIcon(item),
         }).addTo(state.map);
         marker.bindPopup(buildAreaWeatherPopup(item));
-        const entry = state.areaWeatherMarkers.find((candidate) => candidate.icao === item.icao);
-        if (entry) {
-            entry.marker = marker;
-        }
+        state.areaWeatherMarkers.push({
+            icao,
+            name: item.name,
+            lat: Number(item.lat),
+            lon: Number(item.lon),
+            weather: item.weather,
+            marker,
+        });
     });
+
+    state.areaWeatherMarkers = state.areaWeatherMarkers.filter((item) => (
+        nextIcaos.has(String(item.icao || "").toUpperCase()) || markerIsInsideBounds(item, bounds)
+    ));
+}
+
+function buildWeatherLayerIcon(item) {
+    return window.L.divIcon({
+        className: "airport-weather-layer-icon",
+        html: buildAreaWeatherLayerHtml(item),
+        iconSize: [44, 44],
+        iconAnchor: [22, 40],
+    });
+}
+
+function markerIsInsideBounds(item, bounds) {
+    if (!bounds || !Number.isFinite(Number(item?.lat)) || !Number.isFinite(Number(item?.lon))) {
+        return false;
+    }
+
+    return bounds.contains([Number(item.lat), Number(item.lon)]);
 }
 
 function clearAreaWeatherMarkers() {
@@ -1586,17 +2107,29 @@ function formatForecastWindow(forecast) {
     return `Valid ${validFrom.toLocaleString([], { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })} to ${validTo.toLocaleString([], { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })}`;
 }
 
-function buildLegSegments(routePoints) {
+function buildLegSegments(routePoints, checkpointPlan) {
     return routePoints.slice(0, -1).map((point, index) => ({
         index,
         fromIcao: point.icao,
         toIcao: routePoints[index + 1].icao,
-        latLngs: [
-            [point.lat, point.lon],
-            [routePoints[index + 1].lat, routePoints[index + 1].lon],
-        ],
+        latLngs: buildLegLatLngs(point, routePoints[index + 1], checkpointPlan?.legs?.[index]),
         color: LEG_COLORS[index % LEG_COLORS.length],
     }));
+}
+
+function buildLegLatLngs(fromPoint, toPoint, legPlan) {
+    const checkpointVertices = Array.isArray(legPlan?.checkpoints)
+        ? legPlan.checkpoints
+            .filter((checkpoint) => Number.isFinite(Number(checkpoint.lat)) && Number.isFinite(Number(checkpoint.lon)))
+            .sort((left, right) => (Number(left.distanceFromLegStartNm) || 0) - (Number(right.distanceFromLegStartNm) || 0))
+            .map((checkpoint) => [Number(checkpoint.lat), Number(checkpoint.lon)])
+        : [];
+
+    return [
+        [fromPoint.lat, fromPoint.lon],
+        ...checkpointVertices,
+        [toPoint.lat, toPoint.lon],
+    ];
 }
 
 function buildCheckpointMarkers(routePoints, checkpointPlan) {
@@ -1715,9 +2248,14 @@ async function toggleAirspaceOverlay() {
     }
 
     state.showAirspace = !state.showAirspace;
+    trackEvent("airspace_toggled", {
+        source: "map",
+        enabled: state.showAirspace,
+    });
     updateAirspaceToggleButton();
 
     if (!state.showAirspace) {
+        clearScheduledAirspaceRefresh();
         clearAirspaceOverlay();
         updateAirspaceStatus("FAA airspace overlay is off.");
         return;
@@ -1726,11 +2264,33 @@ async function toggleAirspaceOverlay() {
     await refreshAirspaceOverlay();
 }
 
+function scheduleAirspaceOverlayRefresh() {
+    if (!state.showAirspace || !state.map) {
+        return;
+    }
+
+    clearScheduledAirspaceRefresh();
+    updateAirspaceStatus("FAA airspace will update after map movement stops...");
+    state.airspaceRefreshTimer = window.setTimeout(() => {
+        state.airspaceRefreshTimer = null;
+        void refreshAirspaceOverlay();
+    }, AIRSPACE_MOVE_REFRESH_DEBOUNCE_MS);
+}
+
+function clearScheduledAirspaceRefresh() {
+    if (state.airspaceRefreshTimer) {
+        window.clearTimeout(state.airspaceRefreshTimer);
+        state.airspaceRefreshTimer = null;
+    }
+}
+
 async function refreshAirspaceOverlay() {
     if (!state.map) {
         return;
     }
 
+    const requestId = state.airspaceRequestId + 1;
+    state.airspaceRequestId = requestId;
     const bounds = state.map.getBounds();
     const requestedBounds = {
         minLat: bounds.getSouth(),
@@ -1742,6 +2302,9 @@ async function refreshAirspaceOverlay() {
     const routeCacheKey = buildAirspaceRouteCacheKey(state.routeSignature);
     const cached = loadCachedAirspace(cacheKey, requestedBounds, routeCacheKey);
     if (cached) {
+        if (requestId !== state.airspaceRequestId || !state.showAirspace) {
+            return;
+        }
         renderAirspaceOverlay(cached);
         updateAirspaceStatus(`FAA airspace overlay loaded from local cache (${cached.features?.length || 0} feature${cached.features?.length === 1 ? "" : "s"}).`);
         return;
@@ -1757,7 +2320,11 @@ async function refreshAirspaceOverlay() {
     }
 
     const payload = await response.json();
-    cacheAirspace(cacheKey, payload, requestedBounds, routeCacheKey);
+    if (requestId !== state.airspaceRequestId || !state.showAirspace) {
+        return;
+    }
+
+    cacheAirspace(cacheKey, payload, requestedBounds);
     renderAirspaceOverlay(payload);
     updateAirspaceStatus(`FAA airspace overlay loaded for the current view (${payload.features?.length || 0} feature${payload.features?.length === 1 ? "" : "s"}).`);
 }
@@ -1831,7 +2398,7 @@ function loadCachedAirspace(cacheKey, requestedBounds, routeCacheKey) {
         return entry.payload || null;
     }
 
-    if (routeCacheKey && isUsableAirspaceCacheEntry(cache[routeCacheKey], null)) {
+    if (routeCacheKey && isUsableAirspaceCacheEntry(cache[routeCacheKey], requestedBounds)) {
         return cache[routeCacheKey].payload || null;
     }
 
@@ -1844,7 +2411,7 @@ function loadCachedAirspace(cacheKey, requestedBounds, routeCacheKey) {
     return null;
 }
 
-function cacheAirspace(cacheKey, payload, requestedBounds, routeCacheKey) {
+function cacheAirspace(cacheKey, payload, requestedBounds) {
     const cache = readAirspaceCache();
     const entry = {
         savedAt: Date.now(),
@@ -1853,9 +2420,6 @@ function cacheAirspace(cacheKey, payload, requestedBounds, routeCacheKey) {
         classes: "B,C,D,E",
     };
     cache[cacheKey] = entry;
-    if (routeCacheKey) {
-        cache[routeCacheKey] = entry;
-    }
     writeAirspaceCache(cache);
 }
 

@@ -897,6 +897,30 @@ body.map-focus-mode .container > .status-banner {
     gap: 6px;
 }
 
+.map-context-field {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+
+.map-context-field span {
+    color: #64748b;
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+}
+
+.map-context-field input {
+    width: 190px;
+    max-width: 100%;
+    border: 1px solid rgba(71, 85, 105, 0.9);
+    border-radius: 6px;
+    background: #f8fafc;
+    color: #0f172a;
+    font-size: 13px;
+    padding: 6px 8px;
+}
+
 .checkpoint-popup-actions {
     display: flex;
     gap: 8px;
@@ -921,6 +945,14 @@ body.map-focus-mode .container > .status-banner {
 .map-popup-button.danger {
     border-color: rgba(248, 113, 113, 0.6);
     color: #fecaca;
+}
+
+.route-rubber-band-hit-line {
+    cursor: grab;
+}
+
+.route-rubber-band-preview-line {
+    cursor: grabbing;
 }
 
 .checkpoint-button,

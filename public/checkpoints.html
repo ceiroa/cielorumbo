@@ -85,6 +85,55 @@
         .planner-filters { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
         .mode-help { font-size: 12px; color: #94a3b8; margin: 0; }
         .checkpoint-name-cell { display: flex; flex-direction: column; gap: 6px; }
+        .leg-comms-block {
+            margin: 0 0 14px;
+            padding: 12px;
+            border: 1px solid rgba(56, 189, 248, 0.22);
+            border-radius: 10px;
+            background: rgba(15, 23, 42, 0.42);
+        }
+        .leg-comms-header {
+            margin-bottom: 8px;
+            color: #bae6fd;
+            font-size: 12px;
+            font-weight: 800;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+        }
+        .leg-comms-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+            gap: 10px;
+        }
+        .leg-comms-card {
+            display: grid;
+            gap: 4px;
+            padding: 10px;
+            border: 1px solid rgba(71, 85, 105, 0.75);
+            border-radius: 8px;
+            background: rgba(30, 41, 59, 0.72);
+        }
+        .leg-comms-role {
+            color: #94a3b8;
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+        }
+        .leg-comms-airport {
+            color: #f8fafc;
+            font-size: 15px;
+            font-weight: 800;
+        }
+        .leg-comms-name {
+            color: #cbd5e1;
+            font-size: 12px;
+        }
+        .leg-comms-summary {
+            color: #bae6fd;
+            font-size: 12px;
+            line-height: 1.35;
+        }
         .checkpoint-meta { display: flex; gap: 6px; flex-wrap: wrap; }
         .checkpoint-badge {
             display: inline-flex;
@@ -266,7 +315,7 @@
         </aside>
         <div class="container">
             <h1>Checkpoints Planner</h1>
-            <p>Generate draft dead-reckoning checkpoints from the current route, review the names and comms, then save them back to the main nav-log page for Table 3.</p>
+            <p>Generate draft dead-reckoning checkpoints from the current route, review checkpoint names and notes, then save them back to the main nav-log page for Table 3.</p>
 
             <div id="status-banner" class="status-banner" role="status" aria-live="polite"></div>
             <div id="loading-progress" class="loading-progress" role="status" aria-live="polite">
@@ -319,7 +368,7 @@
                 </div>
             </div>
 
-            <p id="planner-hint" class="hint">This first version samples each leg geometrically at about 7 NM spacing. You can edit names and comms before saving.</p>
+            <p id="planner-hint" class="hint">Review each leg's airport communications separately from the visual checkpoints. You can edit checkpoint names and notes before saving.</p>
             </div>
 
             <div id="planner-root"></div>

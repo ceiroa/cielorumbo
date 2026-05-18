@@ -4,12 +4,16 @@ import {
     calculatePressureAltitude,
     calculateWindTriangle,
 } from "./navigation.js";
+import { trackEvent } from "./analytics.js";
 import {
     clearFlightDraft,
     clearCheckpointPlan,
     checkpointPlanLooksLegacy,
     clearNavLogSnapshot,
+    clearNavLogDirty,
     getCheckpointPlanForRoute,
+    getNavLogDirtyRouteSignature,
+    markNavLogDirty,
     loadNavLogSnapshot,
     normalizeAirportCode,
     createRouteSignature,
@@ -88,7 +92,9 @@ document.addEventListener("DOMContentLoaded", async () => {
     } else if (destinationsContainer.children.length === 0) {
         addLeg();
     }
-    restoreMatchingNavLog();
+    if (!shouldAutoRegenerateDirtyNavLog()) {
+        restoreMatchingNavLog();
+    }
     updateGenerateButtonState();
 });
 
@@ -106,7 +112,9 @@ function registerEventHandlers() {
         }
         void generateLog();
     });
-    printButton.addEventListener("click", () => window.print());
+    printButton.addEventListener("click", () => {
+        void printFreshNavLog();
+    });
     menuToggleButton.addEventListener("click", toggleMenu);
     document.addEventListener("click", handleDocumentClick, true);
     document.addEventListener("keydown", handleDocumentKeydown);
@@ -247,12 +255,64 @@ function updatePostNavLogActions(isVisible) {
     postNavlogActions.classList.toggle("visible", isVisible);
 }
 
+function shouldAutoRegenerateDirtyNavLog() {
+    let inputs;
+    let routeSignature;
+    try {
+        inputs = collectFlightInputs();
+        routeSignature = createRouteSignature(inputs);
+    } catch {
+        return false;
+    }
+
+    if (!routeSignature || getNavLogDirtyRouteSignature() !== routeSignature) {
+        return false;
+    }
+
+    const errors = validateFlightInputs(inputs);
+    if (errors.length > 0) {
+        setCheckpointStatus("Nav log needs regeneration after checkpoint changes. Reload route weather before printing.");
+        return false;
+    }
+
+    setCheckpointStatus("Regenerating nav log after checkpoint changes...", "loading");
+    void generateLog();
+    return true;
+}
+
 function invalidateNavLogState() {
     if (generateButton.dataset.mode === "open" || loadNavLogSnapshot()) {
+        let routeSignature = "";
+        try {
+            routeSignature = createRouteSignature(collectFlightInputs());
+        } catch {
+            routeSignature = "";
+        }
         clearNavLogSnapshot();
+        markNavLogDirty(routeSignature);
         hideNavLog();
         updateGenerateButtonState();
     }
+}
+
+async function printFreshNavLog() {
+    printButton.disabled = true;
+    showStatus("Refreshing nav log before print...", "info");
+    const generated = await generateLog().catch((error) => {
+        showStatus(error.message || "Nav log refresh failed before print.", "error");
+        log(`Print refresh failed: ${error.message}`);
+        return false;
+    });
+    printButton.disabled = false;
+    if (!generated) {
+        return;
+    }
+
+    trackEvent("print_pdf_clicked", {
+        source: "home",
+        leg_count: destinationsContainer.children.length,
+    });
+    window.print();
 }
 
 function isNavLogVisible() {
@@ -807,6 +867,10 @@ async function getAirportComms(icao) {
 
 function openCheckpointPlanner() {
     saveCurrentFlightDraft();
+    trackEvent("checkpoint_planner_opened", {
+        source: "home",
+        leg_count: destinationsContainer.children.length,
+    });
     window.location.assign("/checkpoints.html");
 }
 
@@ -817,6 +881,10 @@ function openAircraftProfiles() {
 
 function openRouteMap() {
     saveCurrentFlightDraft();
+    trackEvent("map_opened", {
+        source: "home",
+        leg_count: destinationsContainer.children.length,
+    });
     window.location.assign("/map.html");
 }
 
@@ -915,6 +983,77 @@ function getBearing(lat1, lon1, lat2, lon2) {
     const x = Math.cos(lat1 * Math.PI / 180) * Math.sin(lat2 * Math.PI / 180) -
         Math.sin(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.cos((lon2 - lon1) * Math.PI / 180);
     return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+}
+
+function buildRouteNavigation(inputs, checkpointLegs) {
+    let totalDistanceNm = 0;
+    let fromPoint = {
+        lat: Number(inputs.departure.lat),
+        lon: Number(inputs.departure.lon),
+    };
+    const legs = [];
+
+    inputs.legs.forEach((leg, index) => {
+        const navigation = buildLegNavigationSegments({
+            fromPoint,
+            toPoint: { lat: Number(leg.lat), lon: Number(leg.lon) },
+            checkpoints: Array.isArray(checkpointLegs?.[index]?.checkpoints) ? checkpointLegs[index].checkpoints : [],
+        });
+        totalDistanceNm += navigation.totalDistanceNm;
+        legs.push(navigation);
+        fromPoint = { lat: Number(leg.lat), lon: Number(leg.lon) };
+    });
+
+    return {
+        legs,
+        totalDistanceNm,
+    };
+}
+
+function buildLegNavigationSegments({ fromPoint, toPoint, checkpoints }) {
+    const sortedCheckpoints = Array.isArray(checkpoints)
+        ? [...checkpoints].sort((left, right) => (Number(left.distanceFromLegStartNm) || 0) - (Number(right.distanceFromLegStartNm) || 0))
+        : [];
+    const directLegDistance = getDistance(fromPoint.lat, fromPoint.lon, toPoint.lat, toPoint.lon);
+    const vertices = [
+        { kind: "start", lat: Number(fromPoint.lat), lon: Number(fromPoint.lon) },
+        ...sortedCheckpoints.map((checkpoint) => {
+            const fallbackFraction = directLegDistance === 0
+                ? 0
+                : Math.max(0, Math.min(1, (Number(checkpoint.distanceFromLegStartNm) || 0) / directLegDistance));
+            return {
+                kind: "checkpoint",
+                checkpoint,
+                lat: Number.isFinite(Number(checkpoint.lat))
+                    ? Number(checkpoint.lat)
+                    : Number(fromPoint.lat) + ((Number(toPoint.lat) - Number(fromPoint.lat)) * fallbackFraction),
+                lon: Number.isFinite(Number(checkpoint.lon))
+                    ? Number(checkpoint.lon)
+                    : Number(fromPoint.lon) + ((Number(toPoint.lon) - Number(fromPoint.lon)) * fallbackFraction),
+            };
+        }),
+        { kind: "destination", lat: Number(toPoint.lat), lon: Number(toPoint.lon) },
+    ];
+
+    const segments = [];
+    let cumulativeDistanceNm = 0;
+    for (let index = 1; index < vertices.length; index += 1) {
+        const previous = vertices[index - 1];
+        const current = vertices[index];
+        const distanceNm = getDistance(previous.lat, previous.lon, current.lat, current.lon);
+        cumulativeDistanceNm += distanceNm;
+        segments.push({
+            ...current,
+            distanceNm,
+            cumulativeDistanceNm,
+            trueCourse: getBearing(previous.lat, previous.lon, current.lat, current.lon),
+        });
+    }
+
+    return {
+        segments,
+        totalDistanceNm: cumulativeDistanceNm,
+    };
 }
 
 function collectFlightInputs() {
@@ -1075,6 +1214,7 @@ async function loadPlanFromFile(file) {
         const normalizedPlan = normalizeFlightPlanFile(payload);
         state.weatherCache.clear();
         clearNavLogSnapshot();
+        clearNavLogDirty();
         clearFlightDraft();
         if (normalizedPlan.checkpointPlan) {
             saveCheckpointPlan(normalizedPlan.checkpointPlan);
@@ -1331,7 +1471,7 @@ async function generateLog() {
         setCheckpointStatus("");
         showStatus(error.message, "error");
         log(`Validation failed: ${error.message}`);
-        return;
+        return false;
     }
 
     const inputs = collectFlightInputs();
@@ -1340,7 +1480,7 @@ async function generateLog() {
         setCheckpointStatus("");
         showStatus(errors[0], "error");
         log(`Validation failed: ${errors.join(" | ")}`);
-        return;
+        return false;
     }
 
     showStatus("Loading airport comms...", "info");
@@ -1375,17 +1515,8 @@ async function generateLog() {
     ];
     table1Rows.push(buildRowMarkup(departurePerfRow));
 
-    let totalDistanceRemaining = 0;
     let prevLat = inputs.departure.lat;
     let prevLon = inputs.departure.lon;
-    for (const leg of inputs.legs) {
-        totalDistanceRemaining += getDistance(prevLat, prevLon, leg.lat, leg.lon);
-        prevLat = leg.lat;
-        prevLon = leg.lon;
-    }
-
-    prevLat = inputs.departure.lat;
-    prevLon = inputs.departure.lon;
     let previousIcao = inputs.departure.icao;
     let previousAltitude = inputs.departure.airportAlt;
     let previousSurfaceWindDirection = inputs.departure.windDirection;
@@ -1399,14 +1530,17 @@ async function generateLog() {
         ]),
     ]);
     const approvedCheckpoints = checkpointResult.legs;
+    const routeNavigation = buildRouteNavigation(inputs, approvedCheckpoints);
+    let totalDistanceRemaining = routeNavigation.totalDistanceNm;
     const airportCommsByCode = new Map([
         [inputs.departure.icao, airportCommsEntries[0]],
         ...inputs.legs.map((leg, index) => [leg.icao, airportCommsEntries[index + 1]]),
     ]);
 
     inputs.legs.forEach((leg, index) => {
-        const legDistance = getDistance(prevLat, prevLon, leg.lat, leg.lon);
-        const trueCourse = getBearing(prevLat, prevLon, leg.lat, leg.lon);
+        const legNavigation = routeNavigation.legs[index];
+        const legDistance = legNavigation.totalDistanceNm;
+        const trueCourse = legNavigation.segments[0]?.trueCourse ?? getBearing(prevLat, prevLon, leg.lat, leg.lon);
 
         if (index > 0) {
             const aptPressureAlt = calculatePressureAltitude(previousAltitude, leg.altimeter);
@@ -1490,52 +1624,28 @@ async function generateLog() {
             ((cruiseTimeMinutes / 60) * profiles.cruise.fuel_burn_gph).toFixed(1),
         ]));
 
-        const legCheckpoints = Array.isArray(approvedCheckpoints?.[index]?.checkpoints)
-            ? approvedCheckpoints[index].checkpoints
-            : [];
+        legNavigation.segments.forEach((segment) => {
+            const segmentWind = calculateWindTriangle(segment.trueCourse, profiles.cruise.speed_kts, leg.windDirection, leg.windSpeed);
+            const segmentTrueHeading = (segment.trueCourse + segmentWind.windCorrectionAngle + 360) % 360;
+            const segmentMagHeading = (segmentTrueHeading - leg.variation + 360) % 360;
+            const segmentMinutes = segmentWind.groundspeed === 0 ? 0 : (segment.distanceNm / segmentWind.groundspeed) * 60;
+            const displayMinutes = legNavigation.segments.length === 1
+                ? segmentMinutes + climbTimeMinutes
+                : segmentMinutes;
+            const isDestination = segment.kind === "destination";
 
-        if (legCheckpoints.length === 0) {
-                table3Rows.push(buildRowMarkup([
-                    leg.icao,
-                    cruiseMagHeading.toFixed(0),
-                    legDistance.toFixed(1),
-                    Math.max(0, totalDistanceRemaining - legDistance).toFixed(1),
-                    cruiseWind.groundspeed.toFixed(0),
-                    (climbTimeMinutes + cruiseTimeMinutes).toFixed(0),
-                    airportCommsByCode.get(leg.icao)?.summary || "N/A",
-                ]));
-        } else {
-            let previousCheckpointDistance = 0;
-            for (const checkpoint of legCheckpoints) {
-                const cumulativeDistance = Math.min(legDistance, Math.max(previousCheckpointDistance, Number(checkpoint.distanceFromLegStartNm) || 0));
-                const segmentDistance = cumulativeDistance - previousCheckpointDistance;
-                const segmentMinutes = cruiseWind.groundspeed === 0 ? 0 : (segmentDistance / cruiseWind.groundspeed) * 60;
-
-                table3Rows.push(buildRowMarkup([
-                    checkpoint.name || "CHECKPOINT",
-                    cruiseMagHeading.toFixed(0),
-                    segmentDistance.toFixed(1),
-                    Math.max(0, totalDistanceRemaining - cumulativeDistance).toFixed(1),
-                    cruiseWind.groundspeed.toFixed(0),
-                    segmentMinutes.toFixed(0),
-                    normalizeCheckpointComms(checkpoint.comms),
-                ]));
-
-                previousCheckpointDistance = cumulativeDistance;
-            }
-
-            const finalSegmentDistance = Math.max(0, legDistance - previousCheckpointDistance);
-            const finalMinutes = cruiseWind.groundspeed === 0 ? 0 : (finalSegmentDistance / cruiseWind.groundspeed) * 60;
             table3Rows.push(buildRowMarkup([
-                leg.icao,
-                cruiseMagHeading.toFixed(0),
-                finalSegmentDistance.toFixed(1),
-                Math.max(0, totalDistanceRemaining - legDistance).toFixed(1),
-                cruiseWind.groundspeed.toFixed(0),
-                finalMinutes.toFixed(0),
-                airportCommsByCode.get(leg.icao)?.summary || "N/A",
+                isDestination ? leg.icao : (segment.checkpoint.name || "CHECKPOINT"),
+                segmentMagHeading.toFixed(0),
+                segment.distanceNm.toFixed(1),
+                Math.max(0, totalDistanceRemaining - segment.cumulativeDistanceNm).toFixed(1),
+                segmentWind.groundspeed.toFixed(0),
+                displayMinutes.toFixed(0),
+                isDestination
+                    ? airportCommsByCode.get(leg.icao)?.summary || "N/A"
+                    : normalizeCheckpointComms(segment.checkpoint.comms),
             ]));
-        }
+        });
 
         totalDistanceRemaining -= legDistance;
         prevLat = leg.lat;
@@ -1553,6 +1663,13 @@ async function generateLog() {
 
     document.getElementById("nav-log-container").style.display = "block";
     saveCurrentNavLogSnapshot(inputs);
+    clearNavLogDirty(createRouteSignature(inputs));
+    trackEvent("nav_log_generated", {
+        source: checkpointResult.source,
+        leg_count: inputs.legs.length,
+        checkpoint_count: countCheckpoints(approvedCheckpoints),
+        route_distance_nm: Math.round(routeNavigation.totalDistanceNm),
+    });
     void prefetchAirspaceForRoute(inputs);
     updateGenerateButtonState();
     if (checkpointResult.source === "error") {
@@ -1562,6 +1679,15 @@ async function generateLog() {
         setCheckpointStatus("");
     }
     window.scrollTo(0, document.body.scrollHeight);
+    return true;
+}
+
+function countCheckpoints(checkpointLegs) {
+    if (!Array.isArray(checkpointLegs)) {
+        return 0;
+    }
+
+    return checkpointLegs.reduce((total, leg) => total + (Array.isArray(leg?.checkpoints) ? leg.checkpoints.length : 0), 0);
 }
 
 function isFiniteValue(value, fallback = "") {

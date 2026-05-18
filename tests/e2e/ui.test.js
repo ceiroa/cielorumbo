@@ -1458,10 +1458,11 @@ test.describe('CieloRumbo - UI Tests', () => {
 
         await page.click('[data-accordion-toggle="checkpoints"]');
         await page.locator('#route-map').click({ button: 'right', position: { x: 220, y: 180 } });
+        await page.fill('[data-map-context-name]', 'FOX RIVER BEND');
         await page.click('[data-map-context-add]');
 
         await page.click('[data-accordion-toggle="checkpoints"]');
-        await expect(page.locator('.checkpoint-button')).toContainText(['Map Checkpoint 1']);
+        await expect(page.locator('.checkpoint-button')).toContainText(['FOX RIVER BEND']);
 
         await page.click('[data-checkpoint-index="0"]');
         await page.click('[data-checkpoint-popup-edit="0"]');
@@ -1473,6 +1474,41 @@ test.describe('CieloRumbo - UI Tests', () => {
         await page.click('[data-accordion-toggle="checkpoints"]');
         await expect(page.locator('.checkpoint-button')).toHaveCount(0);
         await expect(page.locator('[data-accordion-section="checkpoints"] .empty-state')).toContainText('No saved checkpoints');
+    });
+
+    test('@map should save a dragged route bend as a named checkpoint', async ({ page }) => {
+        await page.fill('#departure-icao', 'KORD');
+        await page.locator('#departure-icao').blur();
+        await page.fill('.destination-icao', 'KARR');
+        await page.locator('.destination-icao').blur();
+        await page.click('#menu-toggle');
+        await page.click('#open-map-btn');
+
+        const routeLine = page.locator('.route-rubber-band-hit-line').first();
+        await expect(routeLine).toBeVisible();
+        const grabPoint = await page.evaluate(() => {
+            const rect = document.querySelector('.route-rubber-band-hit-line').getBoundingClientRect();
+            return {
+                x: rect.left + rect.width / 2,
+                y: rect.top + rect.height / 2,
+            };
+        });
+        await page.mouse.move(grabPoint.x, grabPoint.y);
+        await page.mouse.down({ button: 'right' });
+        await page.mouse.move(grabPoint.x, grabPoint.y - 80, { steps: 8 });
+        await page.mouse.up({ button: 'right' });
+        await page.fill('[data-map-context-name]', 'RUBBER BAND BEND');
+        await page.locator('[data-route-bend-add]').dispatchEvent('click');
+
+        await page.click('[data-accordion-toggle="checkpoints"]');
+        await expect(page.locator('.checkpoint-button')).toContainText(['RUBBER BAND BEND']);
+        const savedCheckpoint = await page.evaluate(() => {
+            const plan = JSON.parse(localStorage.getItem('openflight-ai-checkpoints'));
+            return plan.legs[0].checkpoints[0];
+        });
+        expect(Number.isFinite(savedCheckpoint.lat)).toBe(true);
+        expect(Number.isFinite(savedCheckpoint.lon)).toBe(true);
+        expect(savedCheckpoint.distanceFromLegStartNm).toBeGreaterThan(0);
     });
 
     test('@planner @map should filter enhanced checkpoints in the planner and route map', async ({ page }) => {
@@ -2049,6 +2085,74 @@ test.describe('CieloRumbo - UI Tests', () => {
         await expect(page.locator('#table3-body tr').nth(0).locator('td').first()).toHaveText('I-80 BRIDGE');
         await expect(page.locator('#table3-body tr').nth(1).locator('td').first()).toHaveText('AURORA LAKE');
         await expect(page.locator('#table3-body tr').nth(2).locator('td').first()).toHaveText('KARR');
+    });
+
+    test('@home should refresh nav log data before printing the PDF', async ({ page }) => {
+        await page.evaluate(() => {
+            window.__printed = false;
+            window.print = () => {
+                window.__printed = true;
+            };
+        });
+
+        await page.fill('#departure-icao', 'KORD');
+        await page.locator('#departure-icao').blur();
+        await page.fill('.destination-icao', 'KARR');
+        await page.locator('.destination-icao').blur();
+        await page.evaluate((signature) => {
+            window.localStorage.setItem('openflight-ai-checkpoints', JSON.stringify({
+                version: 2,
+                routeSignature: signature,
+                mode: 'map',
+                legs: [{
+                    checkpoints: [
+                        { name: 'PRINT FRESH BEND', distanceFromLegStartNm: 20, lat: 42.05, lon: -88.25, comms: 'VIS', type: 'manual', source: 'user' },
+                    ],
+                }],
+            }));
+            window.localStorage.setItem('openflight-ai-nav-log', JSON.stringify({
+                routeSignature: signature,
+                table3Html: '<tr><td>STALE ROW</td></tr>',
+            }));
+        }, routeSignature);
+
+        await page.click('#print-btn');
+        await expect.poll(() => page.evaluate(() => window.__printed)).toBe(true);
+        await expect(page.locator('#table3-body tr').first().locator('td').first()).toHaveText('PRINT FRESH BEND');
+    });
+
+    test('@home should auto-regenerate dirty nav log tables after checkpoint changes', async ({ page }) => {
+        await page.evaluate((signature) => {
+            window.localStorage.clear();
+            window.localStorage.setItem('openflight-ai-flight-draft', JSON.stringify({
+                aircraftName: 'Evektor Harmony LSA',
+                date: '2026-05-17T12:00',
+                departure: { icao: 'KORD', airportAlt: 663, temp: 20, altimeter: 29.92, windSpeed: 10, windDirection: 270, lat: 41.9602, lon: -87.9316, variation: -4 },
+                legs: [{ icao: 'KARR', plannedAlt: 3000, temp: 18, altimeter: 29.92, airportElevation: 699, lat: 41.7713, lon: -88.4815, windDirection: 270, windSpeed: 10, variation: -4 }],
+            }));
+            window.localStorage.setItem('openflight-ai-checkpoints', JSON.stringify({
+                version: 2,
+                routeSignature: signature,
+                mode: 'map',
+                legs: [{
+                    checkpoints: [
+                        { name: 'AUTO REGEN BEND', distanceFromLegStartNm: 20, lat: 42.05, lon: -88.25, comms: 'VIS', type: 'manual', source: 'user' },
+                    ],
+                }],
+            }));
+            window.localStorage.setItem('openflight-ai-nav-log', JSON.stringify({
+                routeSignature: signature,
+                table3Html: '<tr><td>STALE ROW</td></tr>',
+            }));
+            window.localStorage.setItem('openflight-ai-nav-log-dirty', JSON.stringify({
+                routeSignature: signature,
+                dirtyAt: new Date().toISOString(),
+            }));
+        }, routeSignature);
+
+        await page.goto('/index.html?restoreDraft=1');
+        await expect(page.locator('#table3-body tr').first().locator('td').first()).toHaveText('AUTO REGEN BEND');
+        expect(await page.evaluate(() => window.localStorage.getItem('openflight-ai-nav-log-dirty'))).toBeNull();
     });
 
     test('should generate correct row counts for multiple destinations', async ({ page }) => {

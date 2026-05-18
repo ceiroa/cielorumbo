@@ -91,6 +91,10 @@ To keep future changes stable:
 6. Add or update tests in the same change that modifies behavior.
 7. Run an appropriate focused test suite for small changes and `npm test` for release-level changes.
 
+### Analytics Reminder
+
+Analytics is wired through `public/js/analytics.js` and disabled by default in `public/js/analyticsConfig.js`. Create the PostHog project later, add the project API key there, and enable the config before expecting events to appear.
+
 ## GitHub Pages
 
 The public landing/docs site lives under `docs/`.

@@ -2,6 +2,7 @@ import {
     CHECKPOINT_PLAN_VERSION,
     checkpointPlansEqual,
     clearNavLogSnapshot,
+    markNavLogDirty,
     loadFlightDraft,
     loadCheckpointPlan,
     saveCheckpointPlan,
@@ -9,6 +10,7 @@ import {
     clearCheckpointPlan,
     createRouteSignature,
 } from "./flightStore.js";
+import { trackEvent } from "./analytics.js";
 
 const plannerRoot = document.getElementById("planner-root");
 const statusBanner = document.getElementById("status-banner");
@@ -34,12 +36,13 @@ let currentPlan = null;
 let plannerMode = "enhanced";
 let activeTypeFilter = "all";
 let activeSourceFilter = "all";
+const airportCommsCache = new Map();
+const airportCommsLoading = new Set();
 const MIN_PROGRESS_VISIBLE_MS = 1200;
 let progressTimer = null;
 let progressValue = 0;
 let progressStartedAt = 0;
 let plannerBusy = false;
-const DEFAULT_CHECKPOINT_NOTE = "Visual checkpoint";
 
 document.addEventListener("DOMContentLoaded", () => {
     menuToggleButton.addEventListener("click", () => {
@@ -118,6 +121,7 @@ async function initializePlanner() {
     try {
         await hydratePlan();
         renderPlanner();
+        void refreshLegComms();
     } catch (error) {
         showStatus(error.message, "error");
     } finally {
@@ -167,7 +171,7 @@ function renderPlanner() {
                         <tr>
                             <th>Checkpoint Name</th>
                             <th>Distance</th>
-                            <th>Comms / Notes</th>
+                            <th>Checkpoint Notes</th>
                             <th>Action</th>
                         </tr>
                     </thead>
@@ -186,9 +190,8 @@ function renderPlanner() {
                                         <div class="checkpoint-distance-secondary">${escapeHtml(formatDistanceValue(distanceDetailsByIndex[checkpointIndex].fromPreviousNm))} <span>from previous</span></div>
                                     </div>
                                 </td>
-                                <td data-label="Comms / Notes">
-                                    <input type="text" value="${escapeHtml(normalizeCheckpointComms(checkpoint.comms))}" data-field="comms">
-                                    ${checkpoint.notes ? `<div class="checkpoint-note">${escapeHtml(checkpoint.notes)}</div>` : ""}
+                                <td data-label="Checkpoint Notes">
+                                    <input type="text" value="${escapeHtml(getEditableCheckpointNote(checkpoint))}" data-field="notes" placeholder="Visual note">
                                 </td>
                                 <td data-label="Action"><button type="button" class="ghost remove-checkpoint-btn">Remove</button></td>
                             </tr>
@@ -204,6 +207,7 @@ function renderPlanner() {
                 <div><strong>Suggested spacing:</strong> ${legPlan.spacingNm.toFixed(1)} NM</div>
                 <div><strong>Route:</strong> ${legPlan.fromIcao} -> ${legPlan.toIcao}</div>
             </div>
+            ${renderLegComms(legPlan)}
             ${checkpointsHtml}
             <div class="checkpoint-card-actions">
                 <button type="button" class="ghost add-checkpoint-btn" data-leg-index="${index}">Add Checkpoint</button>
@@ -270,6 +274,13 @@ function persistPlannerPlan() {
     const changed = !checkpointPlansEqual(stripPlanTimestamp(previousPlan), stripPlanTimestamp(comparablePlan));
     if (changed) {
         clearNavLogSnapshot();
+        markNavLogDirty(currentPlan.routeSignature || createRouteSignature(currentDraft));
+        trackEvent("checkpoint_plan_saved", {
+            source: "planner",
+            mode: plannerMode,
+            leg_count: currentPlan.legs.length,
+            checkpoint_count: countPlanCheckpoints(currentPlan),
+        });
     }
     return changed;
 }
@@ -294,7 +305,7 @@ function clearPlan() {
 function updateCheckpointFromRow(legIndex, checkpointIndex, row) {
     const checkpoint = currentPlan.legs[legIndex].checkpoints[checkpointIndex];
     checkpoint.name = row.querySelector('[data-field="name"]').value.trim() || checkpoint.name;
-    checkpoint.comms = row.querySelector('[data-field="comms"]').value.trim() || DEFAULT_CHECKPOINT_NOTE;
+    checkpoint.notes = row.querySelector('[data-field="notes"]').value.trim();
 }
 
 async function regeneratePlan(message = "Draft checkpoints regenerated for the current route.") {
@@ -360,11 +371,98 @@ function setPlannerSetupRequiredMode(isRequired) {
     }
 }
 
-function normalizeCheckpointComms(value) {
-    const normalized = String(value || "").trim();
-    return normalized && normalized.toUpperCase() !== "VIS"
-        ? normalized
-        : DEFAULT_CHECKPOINT_NOTE;
+function getEditableCheckpointNote(checkpoint) {
+    const note = String(checkpoint?.notes || "").trim();
+    if (isGeneratedCommsNote(note)) {
+        return "";
+    }
+    return note;
+}
+
+function isGeneratedCommsNote(note) {
+    return /^Nearby airport communications:/i.test(note)
+        || /^Airport candidate with available communications:/i.test(note);
+}
+
+function renderLegComms(legPlan) {
+    const fromIcao = String(legPlan.fromIcao || "").trim().toUpperCase();
+    const toIcao = String(legPlan.toIcao || "").trim().toUpperCase();
+    return `
+        <section class="leg-comms-block" aria-label="Leg communications">
+            <div class="leg-comms-header">Leg Comms</div>
+            <div class="leg-comms-grid">
+                ${renderAirportCommsCard(fromIcao, "Departure")}
+                ${renderAirportCommsCard(toIcao, "Destination")}
+            </div>
+        </section>
+    `;
+}
+
+function renderAirportCommsCard(icao, role) {
+    const comms = airportCommsCache.get(icao);
+    const isLoading = airportCommsLoading.has(icao);
+    const summary = comms?.summary && comms.summary !== "N/A"
+        ? comms.summary
+        : isLoading
+            ? "Loading..."
+            : "N/A";
+    const airportName = comms?.airportName && comms.airportName !== icao
+        ? `<span class="leg-comms-name">${escapeHtml(comms.airportName)}</span>`
+        : "";
+
+    return `
+        <div class="leg-comms-card">
+            <div class="leg-comms-role">${escapeHtml(role)}</div>
+            <div class="leg-comms-airport">${escapeHtml(icao || "----")}</div>
+            ${airportName}
+            <div class="leg-comms-summary">${escapeHtml(summary)}</div>
+        </div>
+    `;
+}
+
+async function refreshLegComms() {
+    const airportCodes = collectPlannerAirportCodes();
+    const missingCodes = airportCodes.filter((icao) => !airportCommsCache.has(icao) && !airportCommsLoading.has(icao));
+    if (missingCodes.length === 0) {
+        return;
+    }
+
+    missingCodes.forEach((icao) => airportCommsLoading.add(icao));
+    renderPlanner();
+
+    await Promise.all(missingCodes.map(async (icao) => {
+        try {
+            const response = await fetch(`/api/airport/${encodeURIComponent(icao)}/comms`);
+            if (!response.ok) {
+                throw new Error(`Airport comms lookup failed for ${icao}.`);
+            }
+            airportCommsCache.set(icao, await response.json());
+        } catch {
+            airportCommsCache.set(icao, {
+                airportName: icao,
+                weather: null,
+                traffic: null,
+                summary: "N/A",
+            });
+        } finally {
+            airportCommsLoading.delete(icao);
+        }
+    }));
+
+    renderPlanner();
+}
+
+function collectPlannerAirportCodes() {
+    const codes = new Set();
+    currentPlan?.legs?.forEach((leg) => {
+        [leg.fromIcao, leg.toIcao].forEach((code) => {
+            const normalized = String(code || "").trim().toUpperCase();
+            if (normalized) {
+                codes.add(normalized);
+            }
+        });
+    });
+    return Array.from(codes);
 }
 
 function showStatus(message, type) {
@@ -401,7 +499,23 @@ async function fetchGeneratedCheckpointPlan() {
         legs: plan.legs || [],
     };
     saveCheckpointPlan(normalizedPlan);
+    clearNavLogSnapshot();
+    markNavLogDirty(normalizedPlan.routeSignature);
+    trackEvent("checkpoint_plan_regenerated", {
+        source: "planner",
+        mode: plannerMode,
+        leg_count: normalizedPlan.legs.length,
+        checkpoint_count: countPlanCheckpoints(normalizedPlan),
+    });
     return normalizedPlan;
+}
+
+function countPlanCheckpoints(plan) {
+    if (!Array.isArray(plan?.legs)) {
+        return 0;
+    }
+
+    return plan.legs.reduce((total, leg) => total + (Array.isArray(leg?.checkpoints) ? leg.checkpoints.length : 0), 0);
 }
 
 function addCheckpointToLeg(legIndex) {

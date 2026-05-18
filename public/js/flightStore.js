@@ -2,6 +2,7 @@ export const SETTINGS_STORAGE_KEY = "openflight-ai-settings";
 export const FLIGHT_DRAFT_STORAGE_KEY = "openflight-ai-flight-draft";
 export const CHECKPOINTS_STORAGE_KEY = "openflight-ai-checkpoints";
 export const NAV_LOG_STORAGE_KEY = "openflight-ai-nav-log";
+export const NAV_LOG_DIRTY_STORAGE_KEY = "openflight-ai-nav-log-dirty";
 export const AIRSPACE_CACHE_STORAGE_KEY = "openflight-airspace-cache-v1";
 export const WEATHER_CACHE_STORAGE_KEY = "openflight-weather-cache-v1";
 export const CHECKPOINT_PLAN_VERSION = 2;
@@ -66,6 +67,27 @@ export function loadNavLogSnapshot() {
 
 export function clearNavLogSnapshot() {
     localStorage.removeItem(NAV_LOG_STORAGE_KEY);
+}
+
+export function markNavLogDirty(routeSignature) {
+    if (!routeSignature) {
+        return;
+    }
+
+    localStorage.setItem(NAV_LOG_DIRTY_STORAGE_KEY, JSON.stringify({
+        routeSignature,
+        dirtyAt: new Date().toISOString(),
+    }));
+}
+
+export function getNavLogDirtyRouteSignature() {
+    return readJsonStorage(NAV_LOG_DIRTY_STORAGE_KEY)?.routeSignature || "";
+}
+
+export function clearNavLogDirty(routeSignature = "") {
+    if (!routeSignature || getNavLogDirtyRouteSignature() === routeSignature) {
+        localStorage.removeItem(NAV_LOG_DIRTY_STORAGE_KEY);
+    }
 }
 
 export function loadAirspaceCache() {

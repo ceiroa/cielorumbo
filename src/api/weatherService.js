@@ -47,12 +47,16 @@ export async function getWeatherStationsInBounds(bounds, options = {}) {
             && lon <= normalizedBounds.maxLon;
     });
 
+    const center = {
+        lat: (normalizedBounds.minLat + normalizedBounds.maxLat) / 2,
+        lon: (normalizedBounds.minLon + normalizedBounds.maxLon) / 2,
+    };
     const limitedStations = stationsInBounds
         .sort((left, right) => {
-            const leftLat = Number(left.lat);
-            const rightLat = Number(right.lat);
-            if (leftLat !== rightLat) {
-                return rightLat - leftLat;
+            const leftDistance = calculateDistanceNm(center.lat, center.lon, Number(left.lat), Number(left.lon));
+            const rightDistance = calculateDistanceNm(center.lat, center.lon, Number(right.lat), Number(right.lon));
+            if (leftDistance !== rightDistance) {
+                return leftDistance - rightDistance;
             }
             return String(left.icaoId).localeCompare(String(right.icaoId));
         })
